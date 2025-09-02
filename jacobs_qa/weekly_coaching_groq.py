@@ -7,6 +7,7 @@ import math
 import datetime as dt
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional
+from dotenv import load_dotenv
 
 import pandas as pd
 import numpy as np
@@ -164,6 +165,8 @@ def clean_output(text: str) -> str:
         text = text.replace(p, "")
     return text.strip()
 
+load_dotenv()
+
 # ========================= GROQ LLM (NO BATCH) ========================= #
 SYSTEM_SUMMARY = (
     "You are a QA coaching assistant. Summarize ONLY improvement-relevant text "
@@ -177,17 +180,41 @@ except Exception:
     Groq = None
 
 
-#list of API keys to rotate through
-# Put your valid key here / or set via env variable
-GROQ_API_KEYS = [
-    os.getenv("GROQ_API_KEY_1", "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"),
-    os.getenv("GROQ_API_KEY_2", "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"),
-    os.getenv("GROQ_API_KEY_3", "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"),
-    os.getenv("GROQ_API_KEY_4", "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"),
-    os.getenv("GROQ_API_KEY_5", "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")
-]
-# Filter out empty keys
-GROQ_API_KEYS = [key for key in GROQ_API_KEYS if key]
+# Get all available API keys from environment variables
+def get_api_keys_from_env():
+    """Extract all GROQ API keys from environment variables"""
+    api_keys = []
+    # Check for common key patterns
+    key_patterns = [
+        "GROQ_API_KEY_1", "GROQ_API_KEY_2", "GROQ_API_KEY_3", "GROQ_API_KEY_4",
+        "GROQ_API_KEY_5"
+    ]
+
+    # Also check for numbered keys up to 20
+    for i in range(1, 21):
+        key_patterns.append(f"GROQ_API_KEY_{i}")
+
+    # Get all environment variables
+    env_vars = os.environ
+
+    # Extract keys that match our patterns
+    for pattern in key_patterns:
+        if pattern in env_vars and env_vars[pattern].strip():
+            api_keys.append(env_vars[pattern].strip())
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_keys = []
+    for key in api_keys:
+        if key not in seen:
+            seen.add(key)
+            unique_keys.append(key)
+
+    return unique_keys
+
+
+# Get API keys from environment
+GROQ_API_KEYS = get_api_keys_from_env()
 
 # Track current key index and usage
 if "groq_key_index" not in st.session_state:
@@ -205,6 +232,7 @@ RATE_LIMIT_PATTERNS = [
     "insufficient_quota"
 ]
 
+
 def is_rate_limit_error(error_msg):
     """Check if error message indicates a rate limit"""
     if not error_msg:
@@ -216,6 +244,7 @@ def is_rate_limit_error(error_msg):
 def get_next_groq_client():
     """Get the next available Groq client with fallback keys"""
     if not GROQ_API_KEYS:
+        st.error("No API keys available. Please check your .env file.")
         return None
 
     # Try current key first if it hasn't hit limit
@@ -268,6 +297,9 @@ def get_next_groq_client():
 
 
 def _groq_complete(messages: List[Dict[str, str]], max_tokens: int = 220) -> str:
+    if not GROQ_API_KEYS:
+        return ""
+
     client = get_next_groq_client()
     if not client:
         return ""
