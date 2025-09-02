@@ -176,25 +176,140 @@ try:
 except Exception:
     Groq = None
 
+
+#list of API keys to rotate through
 # Put your valid key here / or set via env variable
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-_groq_client = Groq(api_key=GROQ_API_KEY) if Groq and GROQ_API_KEY else None
+GROQ_API_KEYS = [
+    os.getenv("GROQ_API_KEY_1", "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"),
+    os.getenv("GROQ_API_KEY_2", "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"),
+    os.getenv("GROQ_API_KEY_3", "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"),
+    os.getenv("GROQ_API_KEY_4", "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"),
+    os.getenv("GROQ_API_KEY_5", "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")
+]
+# Filter out empty keys
+GROQ_API_KEYS = [key for key in GROQ_API_KEYS if key]
+
+# Track current key index and usage
+if "groq_key_index" not in st.session_state:
+    st.session_state.groq_key_index = 0
+if "groq_key_limits" not in st.session_state:
+    st.session_state.groq_key_limits = defaultdict(bool)  # True if key hit limit
+
+# Rate limit error patterns
+RATE_LIMIT_PATTERNS = [
+    "rate limit",
+    "quota",
+    "limit exceeded",
+    "too many requests",
+    "429",
+    "insufficient_quota"
+]
+
+def is_rate_limit_error(error_msg):
+    """Check if error message indicates a rate limit"""
+    if not error_msg:
+        return False
+    error_lower = error_msg.lower()
+    return any(pattern in error_lower for pattern in RATE_LIMIT_PATTERNS)
+
+
+def get_next_groq_client():
+    """Get the next available Groq client with fallback keys"""
+    if not GROQ_API_KEYS:
+        return None
+
+    # Try current key first if it hasn't hit limit
+    current_index = st.session_state.groq_key_index
+    current_key = GROQ_API_KEYS[current_index]
+
+    if current_key and not st.session_state.groq_key_limits[current_index]:
+        try:
+            client = Groq(api_key=current_key)
+            # Quick test to see if key is valid
+            client.models.list(timeout=5)
+            return client
+        except Exception as e:
+            if is_rate_limit_error(str(e)):
+                st.session_state.groq_key_limits[current_index] = True
+                st.warning(f"API key {current_index + 1} hit rate limit. Switching to next key.")
+            else:
+                print(f"API key {current_index + 1} test failed: {e}")
+
+    # If current key hit limit or failed, try other keys
+    for i in range(1, len(GROQ_API_KEYS)):
+        next_index = (current_index + i) % len(GROQ_API_KEYS)
+        next_key = GROQ_API_KEYS[next_index]
+
+        if next_key and not st.session_state.groq_key_limits[next_index]:
+            try:
+                client = Groq(api_key=next_key)
+                client.models.list(timeout=5)  # Quick test
+                st.session_state.groq_key_index = next_index
+                st.info(f"Switched to API key {next_index + 1}")
+                return client
+            except Exception as e:
+                if is_rate_limit_error(str(e)):
+                    st.session_state.groq_key_limits[next_index] = True
+                    print(f"API key {next_index + 1} hit rate limit during test")
+                else:
+                    print(f"API key {next_index + 1} test failed: {e}")
+                continue
+
+    # If all keys hit limits, try to reset and start from beginning
+    if all(st.session_state.groq_key_limits.get(i, False) for i in range(len(GROQ_API_KEYS))):
+        st.warning("All API keys hit limits. Resetting and trying keys again.")
+        for i in range(len(GROQ_API_KEYS)):
+            st.session_state.groq_key_limits[i] = False  # Reset all limits
+        st.session_state.groq_key_index = 0
+        return get_next_groq_client()  # Recursive call to try again
+
+    st.error("All available API keys have hit rate limits or are invalid.")
+    return None
+
 
 def _groq_complete(messages: List[Dict[str, str]], max_tokens: int = 220) -> str:
-    if not _groq_client:
+    client = get_next_groq_client()
+    if not client:
         return ""
+
     try:
-        resp = _groq_client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=DEFAULT_GROQ_MODEL,
             messages=messages,
             temperature=0.2,
             max_tokens=max_tokens,
+            timeout=30  # Add timeout to prevent hanging
         )
         out = (resp.choices[0].message.content or "").strip()
         return clean_output(out)
     except Exception as e:
-        print(f"(Groq) completion error: {e}")
+        current_index = st.session_state.groq_key_index
+        error_msg = str(e)
+
+        if is_rate_limit_error(error_msg):
+            st.session_state.groq_key_limits[current_index] = True
+            print(f"(Groq) rate limit with key {current_index + 1}: {error_msg}")
+
+            # Try with next key immediately
+            new_client = get_next_groq_client()
+            if new_client:
+                try:
+                    resp = new_client.chat.completions.create(
+                        model=DEFAULT_GROQ_MODEL,
+                        messages=messages,
+                        temperature=0.2,
+                        max_tokens=max_tokens,
+                        timeout=30
+                    )
+                    out = (resp.choices[0].message.content or "").strip()
+                    return clean_output(out)
+                except Exception as retry_e:
+                    print(f"(Groq) retry also failed: {retry_e}")
+        else:
+            print(f"(Groq) completion error with key {current_index + 1}: {error_msg}")
+
         return ""
+
 
 def _fallback_summarize(text: str) -> str:
     if not text:
@@ -211,16 +326,17 @@ def _fallback_summarize(text: str) -> str:
         summary = summary[:600].rsplit(" ", 1)[0] + "..."
     return summary
 
+
 def clean_groq_output(text: str) -> str:
     return clean_output(text)
 
+
 def groq_chat_completion(prompt: str, system: str = None) -> str:
+    client = get_next_groq_client()
+    if not client:
+        return ""
+
     try:
-        key = GROQ_API_KEY
-        if not key:
-            print("⚠️ Missing GROQ_API_KEY")
-            return ""
-        client = Groq(api_key=key)
         sys_msg = system or (
             "You are a QA coaching assistant.\n"
             "From the raw comments, output only improvement issues.\n"
@@ -229,13 +345,16 @@ def groq_chat_completion(prompt: str, system: str = None) -> str:
             "- No strengths, no generic advice, no checklists.\n"
             '- If no improvements, respond exactly: "Analyst performed well. No improvement as of now."'
         )
+
         response = client.chat.completions.create(
             model=DEFAULT_GROQ_MODEL,
             messages=[
                 {"role": "system", "content": sys_msg},
                 {"role": "user", "content": prompt},
             ],
+            timeout=30  # Add timeout to prevent hanging
         )
+
         if response and response.choices:
             raw = response.choices[0].message.content or ""
             try:
@@ -244,7 +363,33 @@ def groq_chat_completion(prompt: str, system: str = None) -> str:
                 return (raw or "").strip()
         return ""
     except Exception as e:
-        print(f"Groq API call failed: {e}")
+        current_index = st.session_state.groq_key_index
+        error_msg = str(e)
+
+        if is_rate_limit_error(error_msg):
+            st.session_state.groq_key_limits[current_index] = True
+            print(f"Groq API rate limit with key {current_index + 1}: {error_msg}")
+
+            # Try with next key immediately
+            new_client = get_next_groq_client()
+            if new_client:
+                try:
+                    response = new_client.chat.completions.create(
+                        model=DEFAULT_GROQ_MODEL,
+                        messages=[
+                            {"role": "system", "content": sys_msg},
+                            {"role": "user", "content": prompt},
+                        ],
+                        timeout=30
+                    )
+                    if response and response.choices:
+                        raw = response.choices[0].message.content or ""
+                        return clean_groq_output(raw).strip()
+                except Exception as retry_e:
+                    print(f"(Groq) retry also failed: {retry_e}")
+        else:
+            print(f"Groq API call failed with key {current_index + 1}: {error_msg}")
+
         return ""
 
 def synthesize_areas_to_improve(all_comments: List[str], employee_name: str, seed_examples: List[str]) -> str:
@@ -681,6 +826,26 @@ def main():
                             index=min(4, week_of_month(dt.date.today()) - 1), key="sidebar_week")
         do_generate = st.button("Generate Tracker", type="primary", key="sidebar_generate")
 
+        # Add API status button
+        if st.button("Show API Key Status"):
+            status_text = "API Key Status:\n"
+            for i, key in enumerate(GROQ_API_KEYS):
+                hit_limit = st.session_state.groq_key_limits.get(i, False)
+                status = "Active" if not hit_limit and i == st.session_state.groq_key_index else "Available" if not hit_limit else "Rate Limited"
+                status_text += f"Key {i + 1}: {status}\n"
+
+            # Show which key is currently active
+            active_key = st.session_state.groq_key_index + 1
+            status_text += f"\nCurrent Active Key: {active_key}"
+
+            st.sidebar.info(status_text)
+
+        # Add a button to reset all API key limits
+        if st.button("Reset All API Key Limits"):
+            for i in range(len(GROQ_API_KEYS)):
+                st.session_state.groq_key_limits[i] = False
+            st.session_state.groq_key_index = 0
+            st.sidebar.success("All API key limits have been reset!")
     st.warning("Emp ID, Organization, and Status are intentionally left blank. Please enrich later from HRIS.")
 
     # ----- Handle uploaded saved tracker FIRST (if present) -----
@@ -696,7 +861,7 @@ def main():
                 tracker["__score__"] = tracker.apply(_row_perf_score, axis=1)
             st.session_state["tracker"] = tracker
             st.session_state["uploaded_tracker_df"] = tracker.copy()
-            st.success(f"✅ Loaded saved tracker. Rows: {len(tracker)}")
+            st.success(f"Loaded saved tracker. Rows: {len(tracker)}")
             st.dataframe(tracker, use_container_width=True, hide_index=True)
             # show treemap and quick views (common)
             render_treemap(tracker)
